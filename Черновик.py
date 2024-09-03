@@ -20,15 +20,16 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # Состояния разговора
-INIT, WAITING_INPUT, ADDITIONAL_CHANNELS, CHANNELS_INPUT, CONFIRMATION, FINISH_CONTEST, WAITING_FOR_TRACKED_DATE = range(7)
+INIT, WAITING_INPUT, ADDITIONAL_CHANNELS, CHANNELS_INPUT, CONFIRMATION, FINISH_CONTEST, WAITING_FOR_TRACKED_DATE,\
+    WAITING_FOR_PENDING_DOP_CHANNELS, START, AWAITING_DATE, END = range(11)
 
 # Параметры подключения к базе данных
 DB_PARAMS = {
-    "database": "a",
-    "user": "a",
+    "database": "Telegram",
+    "user": "postgres",
     "password": "a",
-    "host": "a",
-    "port": "a"
+    "host": "localhost",
+    "port": "5432"
 }
 
 # Список администраторов
@@ -134,6 +135,7 @@ async def finish_contest_request(update, context):
 
 
 # Функция для обновления статуса конкурса
+# Функция для обновления статуса конкурса
 async def update_contest_status(update, context):
     if update.effective_user.id not in ADMIN_USERS:
         await update.message.reply_text("У вас недостаточно прав для завершения конкурсов.")
@@ -161,7 +163,6 @@ async def update_contest_status(update, context):
         RETURNING *
     """)
     result = execute_query(query, (text,))
-
     if result:
         await update.message.reply_text(
             f"Статус конкурса успешно обновлен на 'Завершен'.",
@@ -223,6 +224,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
 
+    # Удаляем приветственное сообщение, если оно есть
     if 'welcome_message_id' in context.user_data:
         try:
             await context.bot.delete_message(
@@ -233,17 +235,27 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Не удалось удалить приветственное сообщение: {e}")
         del context.user_data['welcome_message_id']
 
+    # Обработка ввода для различных состояний
+    if context.user_data.get('waiting_for_pending_date'):
+        return await handle_pending_date_input(update, context)
+    elif context.user_data.get('waiting_for_pending_dop_channels'):
+        return await handle_pending_dop_channels_input(update, context)
+    elif context.user_data.get('waiting_for_tracked_date'):
+        return await handle_tracked_date_input(update, context)
+    elif context.user_data.get('waiting_for_date'):
+        return await handle_date_input(update, context)
+
+    # Удаляем сообщение пользователя
     try:
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
     except Exception as e:
         print(f"Не удалось удалить сообщение пользователя: {e}")
 
+    # Обработка URL
     if is_url(text):
         return await handle_url_input(update, context)
-    elif is_date(text) and 'link' in context.user_data:
-        context.user_data['date'] = process_date(text)
-        await ask_for_missing_info(update, context)
-        return WAITING_INPUT
+
+    # Обработка команд
     elif text == "Показать все конкурсы":
         await show_contests(update, context)
         return WAITING_INPUT
@@ -252,12 +264,45 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_INPUT
     elif text == "Завершить конкурс":
         return await finish_contest_request(update, context)
+
+    # Если ввод не соответствует ни одному из ожидаемых форматов
     else:
-        await update.message.reply_text(
+        await update_or_send_message(
+            update, context,
             "Я не понимаю. Пожалуйста, отправьте ссылку на конкурс, дату в формате ДД.ММ, или выберите действие из меню.",
-            disable_web_page_preview=True
+            reply_markup=None
         )
         return WAITING_INPUT
+
+async def update_or_send_message(update, context, text, reply_markup=None):
+    if 'message_id' in context.user_data:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['message_id'],
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            print(f"Не удалось отредактировать сообщение: {e}")
+            # Если не удалось отредактировать, отправляем новое сообщение
+            message = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            context.user_data['message_id'] = message.message_id
+    else:
+        # Если нет сохраненного message_id, отправляем новое сообщение
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+        context.user_data['message_id'] = message.message_id
 
 async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_cancel_message(update, context)
@@ -273,13 +318,13 @@ async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("Добавить конкурс", callback_data='add_contest')])
     keyboard.append([InlineKeyboardButton("Отслеживание", callback_data='track_contest')])
     if context.user_data.get('is_admin', False):
-        keyboard.append([InlineKeyboardButton("Добавить в БД", callback_data='add_to_pending')])
+        keyboard.append([InlineKeyboardButton("Добавить позже", callback_data='add_to_pending')])
     keyboard.append([InlineKeyboardButton("Отмена", callback_data='cancel')])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     message = await update.message.reply_text(
-        f"Ссылка: {url}\n\nЧто вы хотите сделать?\nЕсли вы хотите добавить конкурс, введите дату в формате ДД.ММ",
+        f"Ссылка: {url}\n\nЧто вы хотите сделать?",
         reply_markup=reply_markup,
         disable_web_page_preview=True
     )
@@ -287,7 +332,7 @@ async def handle_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return WAITING_INPUT
 
-async def handle_url_action(update, context):
+async def handle_url_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_success_message(update, context)
     query = update.callback_query
     await query.answer()
@@ -300,19 +345,26 @@ async def handle_url_action(update, context):
     elif query.data == 'add_contest':
         if update.effective_user.id in ADMIN_USERS:
             context.user_data['waiting_for_date'] = True
-            await ask_for_missing_info(update, context)
+            await query.edit_message_text(
+                f"Пожалуйста, введите дату конкурса в формате ДД.ММ для ссылки:\n{context.user_data['link']}",
+                disable_web_page_preview=True
+            )
         else:
             await query.edit_message_text("У вас недостаточно прав для добавления конкурсов.")
     elif query.data == 'track_contest':
         context.user_data['tracked_link'] = context.user_data['link']
+        context.user_data['waiting_for_tracked_date'] = True  # Добавляем этот флаг
         await query.edit_message_text(
             f"Пожалуйста, введите дату конкурса в формате ДД.ММ для ссылки:\n{context.user_data['link']}",
             disable_web_page_preview=True
         )
-        return WAITING_FOR_TRACKED_DATE
     elif query.data == 'add_to_pending':
         if update.effective_user.id in ADMIN_USERS:
-            await add_to_pending_contests(update, context)
+            context.user_data['waiting_for_pending_date'] = True  # Добавляем этот флаг
+            await query.edit_message_text(
+                f"Пожалуйста, введите дату конкурса в формате ДД.ММ для ссылки:\n{context.user_data['link']}",
+                disable_web_page_preview=True
+            )
         else:
             await query.edit_message_text("У вас недостаточно прав для добавления в БД.")
     elif query.data == 'cancel':
@@ -567,13 +619,13 @@ async def finish_contest(update, context):
         await query.edit_message_text("Ошибка: ссылка на конкурс не найдена.")
         return WAITING_INPUT
 
-    update_query = sql.SQL("""
+    update_query = """
         UPDATE contests.contests
         SET status = 'Завершен'
-        WHERE link = %s
+        WHERE link = $1
         RETURNING *
-    """)
-    result = execute_query(update_query, (link,))
+    """
+    result = await execute_query(update_query, (link,))  # Corrected placeholder usage
 
     if result:
         message = f"Конкурс по ссылке {link} успешно завершен. Что бы вы хотели сделать дальше?"
@@ -1030,21 +1082,15 @@ async def switch_contest_type(update, context):
         status = 'Активен'  # По умолчанию
 
     # Удаляем сообщение о добавлении конкурса в отслеживаемые
-    async def switch_contest_type(update, context):
-        await delete_success_message(update, context)
-        query = update.callback_query
-        await query.answer()
-
-        # Удаляем сообщение о добавлении конкурса в отслеживаемые
-        if 'tracked_added_message_id' in context.user_data:
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=context.user_data['tracked_added_message_id']
-                )
-            except Exception as e:
-                print(f"Не удалось удалить сообщение о добавлении в отслеживаемые: {e}")
-            del context.user_data['tracked_added_message_id']
+    if 'tracked_added_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['tracked_added_message_id']
+            )
+        except Exception as e:
+            print(f"Не удалось удалить сообщение о добавлении в отслеживаемые: {e}")
+        del context.user_data['tracked_added_message_id']
 
     is_admin = update.effective_user.id in ADMIN_USERS
     context.user_data['is_admin'] = is_admin  # Обновляем статус админа
@@ -1067,15 +1113,53 @@ async def add_to_pending_contests(update: Update, context: ContextTypes.DEFAULT_
     context.user_data['waiting_for_pending_date'] = True
     return WAITING_INPUT
 
+
 async def handle_pending_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_text = update.message.text
+
+    # Удаляем сообщение пользователя
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    except Exception as e:
+        print(f"Не удалось удалить сообщение пользователя: {e}")
+
     if is_date(date_text):
-        context.user_data['pending_date'] = process_date(date_text)
+        # Проверяем наличие 'pending_contest' в context.user_data
+        if 'pending_contest' not in context.user_data:
+            context.user_data['pending_contest'] = {}
+
+        # Сохраняем дату
+        context.user_data['pending_contest']['date'] = process_date(date_text)
+
+        # Проверяем наличие ссылки
+        if 'link' not in context.user_data['pending_contest']:
+            print("Ошибка: ссылка отсутствует в pending_contest")
+            context.user_data['pending_contest']['link'] = "Не указана"
+
+        del context.user_data['waiting_for_pending_date']
+
+        print(f"Текущие данные pending_contest: {context.user_data['pending_contest']}")
+
+        # Обновляем сообщение с черновиком
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data.get('message_id'),
+                text=f"Черновик ожидающего конкурса:\n\n"
+                     f"Ссылка: {context.user_data['pending_contest'].get('link', 'Не указана')}\n"
+                     f"Дата: {context.user_data['pending_contest']['date']}\n"
+                     f"Доп. каналы: Еще не указаны",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            print(f"Не удалось обновить сообщение с черновиком: {e}")
+
         await ask_for_pending_dop_channels(update, context)
         return WAITING_INPUT
     else:
         await update.message.reply_text("Неверный формат даты. Пожалуйста, введите дату в формате ДД.ММ.")
         return WAITING_INPUT
+
 
 async def ask_for_pending_dop_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -1083,14 +1167,31 @@ async def ask_for_pending_dop_channels(update: Update, context: ContextTypes.DEF
          InlineKeyboardButton("Нет", callback_data='pending_no')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"Добавление конкурса в список ожидающих:\n\n"
-        f"Ссылка: {context.user_data['link']}\n"
-        f"Дата: {context.user_data['pending_date']}\n\n"
-        f"Нужно подписаться на доп. каналы?",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True
-    )
+
+    # Проверяем наличие ссылки
+    link = context.user_data['pending_contest'].get('link', 'Не указана')
+    if link == 'Не указана':
+        print("Предупреждение: ссылка отсутствует в pending_contest")
+
+    message_text = (f"Добавление конкурса в список ожидающих:\n\n"
+                    f"Ссылка: {link}\n"
+                    f"Дата: {context.user_data['pending_contest'].get('date', 'Не указана')}\n\n"
+                    f"Нужно подписаться на доп. каналы?")
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=context.user_data.get('message_id'),
+            text=message_text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        print(f"Не удалось отредактировать сообщение: {e}")
+        # Если не удалось отредактировать, отправляем новое сообщение
+        message = await update.message.reply_text(message_text, reply_markup=reply_markup, disable_web_page_preview=True)
+        context.user_data['message_id'] = message.message_id
+
     return WAITING_INPUT
 
 async def handle_pending_dop_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1098,30 +1199,38 @@ async def handle_pending_dop_channels(update: Update, context: ContextTypes.DEFA
     await query.answer()
 
     if query.data == 'pending_yes':
+        context.user_data['waiting_for_pending_dop_channels'] = True
         await query.edit_message_text(
             f"Добавление конкурса в список ожидающих:\n\n"
-            f"Ссылка: {context.user_data['link']}\n"
-            f"Дата: {context.user_data['pending_date']}\n\n"
-            f"Пожалуйста, напишите ссылки на доп. каналы через запятую."
+            f"Ссылка: {context.user_data['pending_contest']['link']}\n"
+            f"Дата: {context.user_data['pending_contest']['date']}\n\n"
+            f"Пожалуйста, напишите ссылки на доп. каналы через запятую.",
+            disable_web_page_preview=True
         )
-        context.user_data['waiting_for_pending_dop_channels'] = True
-        return WAITING_INPUT
+        return WAITING_FOR_PENDING_DOP_CHANNELS  # Новое состояние
     elif query.data == 'pending_no':
-        context.user_data['pending_dop_channels'] = 'false'
+        context.user_data['pending_contest']['dop_channels'] = 'false'
         await save_pending_contest(update, context)
         return WAITING_INPUT
 
+
 async def handle_pending_dop_channels_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dop_channels = update.message.text
-    context.user_data['pending_dop_channels'] = dop_channels
+
+    # Удаляем сообщение пользователя
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    except Exception as e:
+        print(f"Не удалось удалить сообщение пользователя: {e}")
+
+    context.user_data['pending_contest']['dop_channels'] = dop_channels
+    del context.user_data['waiting_for_pending_dop_channels']  # Удаляем флаг ожидания
     await save_pending_contest(update, context)
     return WAITING_INPUT
 
 
 async def save_pending_contest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = context.user_data['link']
-    date = context.user_data['pending_date']
-    dop_channels = context.user_data.get('pending_dop_channels', 'false')
+    pending_contest = context.user_data['pending_contest']
 
     insert_query = """
         INSERT INTO contests.pending_contests (link, date, dop_channels)
@@ -1129,26 +1238,33 @@ async def save_pending_contest(update: Update, context: ContextTypes.DEFAULT_TYP
         ON CONFLICT (link) DO UPDATE
         SET date = EXCLUDED.date, dop_channels = EXCLUDED.dop_channels
     """
-    await execute_query(insert_query, (link, date, dop_channels))
+    try:
+        await execute_query(insert_query,
+                            (pending_contest['link'], pending_contest['date'], pending_contest.get('dop_channels', 'false')))
+    except Exception as e:
+        print(f"Ошибка при сохранении ожидающего конкурса: {e}")
+        await update.message.reply_text("Произошла ошибка при сохранении конкурса. Пожалуйста, попробуйте еще раз.")
+        return WAITING_INPUT
 
-    message = await update.message.reply_text(
-        f"Конкурс успешно добавлен в список ожидающих:\n\n"
-        f"Ссылка: {link}\n"
-        f"Дата: {date}\n"
-        f"Доп. каналы: {dop_channels}",
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data['message_id'],
+        text=f"Конкурс успешно добавлен в список ожидающих:\n\n"
+             f"Ссылка: {pending_contest['link']}\n"
+             f"Дата: {pending_contest['date']}\n"
+             f"Доп. каналы: {pending_contest.get('dop_channels', 'Нет')}",
         disable_web_page_preview=True
     )
 
-    context.user_data['success_message_id'] = message.message_id
-
     # Очищаем данные пользователя
-    for key in ['link', 'pending_date', 'pending_dop_channels', 'waiting_for_pending_date',
-                'waiting_for_pending_dop_channels']:
+    for key in ['pending_contest', 'waiting_for_pending_date', 'waiting_for_pending_dop_channels']:
         context.user_data.pop(key, None)
 
     # Показываем список конкурсов через 3 секунды
     await asyncio.sleep(3)
     await show_contests(update, context)
+
+    return WAITING_INPUT
 
 
 # Функция для отображения списка ожидающих конкурсов
@@ -1199,21 +1315,59 @@ async def transfer_to_main_db(update, context):
     if 0 <= contest_index < len(pending_contests):
         link = pending_contests[contest_index]['link']
 
-        # Здесь вам нужно реализовать логику добавления конкурса в основную таблицу
-        # Например, вы можете использовать существующую функцию add_contest_to_db
-        # await add_contest_to_db(link, date, dop_channels, status='Активен')
+        # Получаем данные о конкурсе из таблицы pending_contests
+        get_pending_contest_query = "SELECT * FROM contests.pending_contests WHERE link = $1"
+        pending_contest_data = await execute_query(get_pending_contest_query, (link,))
 
-        # Удаляем конкурс из таблицы pending_contests
-        delete_query = "DELETE FROM contests.pending_contests WHERE link = $1"
-        await execute_query(delete_query, (link,))
+        if pending_contest_data:
+            # Добавляем конкурс в основную таблицу
+            add_query = """
+            INSERT INTO contests.contests (link, date, dop_channels, status)
+            VALUES ($1, $2, $3, 'Активен')
+            """
+            await execute_query(add_query, (link, pending_contest_data[0]['date'], pending_contest_data[0]['dop_channels']))
 
-        await query.edit_message_text(f"Конкурс {link} перенесен в основную базу данных.")
+            # Удаляем конкурс из таблицы pending_contests
+            delete_query = "DELETE FROM contests.pending_contests WHERE link = $1"
+            await execute_query(delete_query, (link,))
+
+            await query.edit_message_text(f"Конкурс {link} перенесен в основную базу данных.")
+        else:
+            await query.edit_message_text("Не удалось найти данные о конкурсе в таблице ожидающих конкурсов.")
     else:
         await query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
 
     return WAITING_INPUT
 
-# Основная функция
+def handle_add_later(update, context):
+    query = update.callback_query
+    user_data = context.user_data
+
+    # Extract the link from the previous message or assume an inline button callback
+    link = query.message.reply_to_message.text if query.message.reply_to_message else None
+    if link:
+        if 'pending_contest' not in user_data:
+            user_data['pending_contest'] = {}
+
+        user_data['pending_contest']['link'] = link  # Save the link into pending_contest
+        query.edit_message_text("Пожалуйста, введите дату для вашего конкурса:")
+        return AWAITING_DATE
+    else:
+        query.edit_message_text("Ошибка: Не удалось извлечь ссылку. Попробуйте еще раз.")
+        return START
+
+def handle_date_entry(update, context):
+    text = update.message.text
+    user_data = context.user_data
+
+    if 'pending_contest' in user_data and 'link' in user_data['pending_contest']:
+        user_data['pending_contest']['date'] = text  # Only update the date
+        update.message.reply_text("Спасибо! Ваш конкурс сохранен в черновиках.")
+    else:
+        update.message.reply_text("Ошибка: Ссылка не найдена в черновике.")
+
+    return END
+
 def main():
     application = Application.builder().token("a").build()
     conv_handler = ConversationHandler(
@@ -1251,6 +1405,16 @@ def main():
             FINISH_CONTEST: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, update_contest_status),
             ],
+            WAITING_FOR_PENDING_DOP_CHANNELS: [  # Новое состояние
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pending_dop_channels_input),
+            ],
+            START:
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_later),
+            ],
+            AWAITING_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_entry)],
+            END:
+                [MessageHandler(filters.TEXT & ~filters.COMMAND, end_conversation)],
         },
         fallbacks=[CommandHandler('start', start)],
     )
