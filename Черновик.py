@@ -25,13 +25,13 @@ INIT, WAITING_INPUT, ADDITIONAL_CHANNELS, CHANNELS_INPUT, CONFIRMATION, FINISH_C
 DB_PARAMS = {
     "database": "Telegram",
     "user": "postgres",
-    "password": "a",
+    "password": "1",
     "host": "localhost",
     "port": "5432"
 }
 
 # Список администраторов
-ADMIN_USERS = [a]  # Замените на реальные ID администраторов
+ADMIN_USERS = [1]  # Замените на реальные ID администраторов
 
 async def error_handler(update, context):
     """Log the error and send a telegram message to notify the developer."""
@@ -119,6 +119,11 @@ def get_main_keyboard(is_admin=False):
     if is_admin:
         keyboard.append([KeyboardButton("Добавить в БД")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def add_admin_buttons(keyboard, is_admin):
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("📥 Показать ожидающие конкурсы", callback_data='show_pending_contests')])
+    return keyboard
 
 async def handle_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_text = update.message.text
@@ -295,6 +300,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_INPUT
 
+# Удаляет сообщение пользователя после ввода даты, каналов и т.д.
 async def update_or_send_message(update, context, text, reply_markup=None):
     if 'message_id' in context.user_data:
         try:
@@ -420,38 +426,40 @@ async def handle_url_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_INPUT
 
 # Новая функция для отображения отслеживаемых конкурсов
-async def show_tracked_contests(update, context):
+async def show_tracked_contests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
     user_id = update.effective_user.id
-    tracked_contests = await get_tracked_contests(user_id)  # Добавлен await
+    tracked_contests = await get_tracked_contests(user_id)
 
     if not tracked_contests:
         message = "У вас нет отслеживаемых конкурсов."
     else:
         message = "Отслеживаемые конкурсы:\n\n"
-        for i, contest in enumerate(tracked_contests, 1):
-            message += f"{i}. {contest['link']} - {contest['date']}\n"
+        for contest in tracked_contests:
+            link = contest.get('link', 'Ссылка отсутствует')
+            date = contest.get('date', 'Дата не указана')
+            message += f"<a href='{link}'>{link}</a>\nДата: {date}\n\n"
 
     keyboard = [
         [InlineKeyboardButton("🏆 Активные", callback_data='show_active'),
          InlineKeyboardButton("🏁 Завершенные", callback_data='show_completed'),
          InlineKeyboardButton("👀 Отслеживание", callback_data='show_tracked')],
-        [InlineKeyboardButton("➕ Добавить", callback_data='add_tracked'),
-         InlineKeyboardButton("➖ Удалить", callback_data='delete_tracked')]
+        [InlineKeyboardButton("🔄 Обновить", callback_data='refresh_tracked')]
     ]
+
+    is_admin = user_id in ADMIN_USERS
+    keyboard = add_admin_buttons(keyboard, is_admin)
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=message,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
-        )
-    else:
-        await update.message.reply_text(
-            message,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
-        )
+    await query.edit_message_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
     return WAITING_INPUT
 
@@ -555,7 +563,7 @@ async def delete_tracked_contest(update, context):
     await query.answer()
 
     user_id = update.effective_user.id
-    tracked_contests = get_tracked_contests(user_id)
+    tracked_contests = await get_tracked_contests(user_id)  # Добавлен await
 
     if not tracked_contests:
         await query.edit_message_text("У вас нет отслеживаемых конкурсов.")
@@ -582,14 +590,14 @@ async def handle_delete_tracked(update, context):
 
     index = int(query.data.split('_')[1]) - 1
     user_id = update.effective_user.id
-    tracked_contests = get_tracked_contests(user_id)
+    tracked_contests = await get_tracked_contests(user_id)  # Добавлен await
 
     if 0 <= index < len(tracked_contests):
         link_to_delete = tracked_contests[index]['link']
-        remove_tracked_contest(user_id, link_to_delete)
+        await remove_tracked_contest(user_id, link_to_delete)  # Добавлен await
 
         # Обновляем список отслеживаемых конкурсов после удаления
-        updated_tracked_contests = get_tracked_contests(user_id)
+        updated_tracked_contests = await get_tracked_contests(user_id)  # Добавлен await
 
         if not updated_tracked_contests:
             message = "У вас больше нет отслеживаемых конкурсов."
@@ -963,7 +971,7 @@ async def show_contests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if is_admin:
-        keyboard.append([InlineKeyboardButton("📥 Добавить в БД", callback_data='show_pending_contests')])
+        keyboard.append([InlineKeyboardButton("📥 Показать ожидающие конкурсы", callback_data='show_pending_contests')])
 
     keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data='refresh_Активен')])
 
@@ -1152,9 +1160,9 @@ async def add_to_pending_contests(update: Update, context: ContextTypes.DEFAULT_
 
     link = context.user_data['link']
 
-    await query.edit_message_text(
-        f"Добавление конкурса в список ожидающих:\n\nСсылка: {link}\n\nПожалуйста, введите дату конкурса в формате ДД.ММ",
-        disable_web_page_preview=True
+    await update_or_send_message(
+        update, context,
+        f"Добавление конкурса в список ожидающих:\n\nСсылка: {link}\n\nПожалуйста, введите дату конкурса в формате ДД.ММ"
     )
     context.user_data['waiting_for_pending_date'] = True
     return WAITING_FOR_PENDING_DATE
@@ -1168,9 +1176,14 @@ async def handle_pending_date_input(update: Update, context: ContextTypes.DEFAUL
             'link': context.user_data['link'],
             'date': process_date(date_text)
         }
+        await update.message.delete()
         return await ask_for_pending_dop_channels(update, context)
     else:
-        await update.message.reply_text("Неверный формат даты. Пожалуйста, введите дату в формате ДД.ММ.")
+        await update_or_send_message(
+            update, context,
+            f"Добавление конкурса в список ожидающих:\n\nСсылка: {context.user_data['link']}\n\nНеверный формат даты. Пожалуйста, введите дату в формате ДД.ММ."
+        )
+        await update.message.delete()
         return WAITING_FOR_PENDING_DATE
 
 
@@ -1186,7 +1199,7 @@ async def ask_for_pending_dop_channels(update: Update, context: ContextTypes.DEF
                     f"Дата: {context.user_data['pending_contest']['date']}\n\n"
                     f"Нужно подписаться на доп. каналы?")
 
-    await update.message.reply_text(message_text, reply_markup=reply_markup, disable_web_page_preview=True)
+    await update_or_send_message(update, context, message_text, reply_markup)
     return WAITING_INPUT
 
 async def handle_pending_dop_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1195,12 +1208,12 @@ async def handle_pending_dop_channels(update: Update, context: ContextTypes.DEFA
 
     if query.data == 'pending_yes':
         context.user_data['waiting_for_pending_dop_channels'] = True
-        await query.edit_message_text(
+        await update_or_send_message(
+            update, context,
             f"Добавление конкурса в список ожидающих:\n\n"
             f"Ссылка: {context.user_data['pending_contest']['link']}\n"
             f"Дата: {context.user_data['pending_contest']['date']}\n\n"
-            f"Пожалуйста, напишите ссылки на доп. каналы через запятую.",
-            disable_web_page_preview=True
+            f"Пожалуйста, напишите ссылки на доп. каналы через запятую."
         )
         return WAITING_FOR_PENDING_DOP_CHANNELS
     elif query.data == 'pending_no':
@@ -1216,13 +1229,10 @@ async def handle_pending_dop_channels_input(update: Update, context: ContextType
     else:
         context.user_data['pending_contest']['dop_channels'] = False
 
-    del context.user_data['waiting_for_pending_dop_channels']  # Удаляем флаг ожидания
+    del context.user_data['waiting_for_pending_dop_channels']
 
-    # Добавляем лог для отладки
-    logging.info(f"Pending contest before saving: {context.user_data['pending_contest']}")
-
-    await save_pending_contest(update, context)
-    return WAITING_INPUT
+    await update.message.delete()
+    return await save_pending_contest(update, context)
 
 
 
@@ -1232,8 +1242,8 @@ async def save_pending_contest(update: Update, context: ContextTypes.DEFAULT_TYP
 
     logging.info(f"Attempting to save pending contest: {pending_contest}")
 
-    if 'link' in pending_contest and 'date' in pending_contest:
-        query = "INSERT INTO contests.pending_contests (link, date, dop_channels) VALUES (\$1, \$2, \$3)"
+    if 'link' in pending_contest and 'date' in pending_contest and not user_data.get('contest_saved', False):
+        query = "INSERT INTO contests.pending_contests (link, date, dop_channels) VALUES ($1, $2, $3)"
 
         dop_channels = pending_contest.get('dop_channels', 'false')
         if isinstance(dop_channels, str):
@@ -1253,9 +1263,6 @@ async def save_pending_contest(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await execute_query(query, params)
 
-            # Очищаем данные пользователя
-            del user_data['pending_contest']
-
             success_message = (
                 "Конкурс добавлен в список ожидающих:\n\n"
                 f"Ссылка: {pending_contest['link']}\n"
@@ -1264,57 +1271,64 @@ async def save_pending_contest(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Спасибо за участие!"
             )
 
-            if update.callback_query:
-                await update.callback_query.answer()
-                await update.callback_query.edit_message_text(success_message, disable_web_page_preview=True)
-            else:
-                await update.message.reply_text(success_message, disable_web_page_preview=True)
+            await update_or_send_message(update, context, success_message)
+
+            # Отмечаем, что конкурс сохранен
+            user_data['contest_saved'] = True
+
+            # Очищаем данные пользователя
+            del user_data['pending_contest']
+
         except Exception as e:
             logging.error(f"Error saving to database: {e}", exc_info=True)
             error_message = f"Произошла ошибка при сохранении конкурса: {str(e)}. Пожалуйста, попробуйте еще раз."
-
-            if update.callback_query:
-                await update.callback_query.answer()
-                await update.callback_query.edit_message_text(error_message, disable_web_page_preview=True)
-            else:
-                await update.message.reply_text(error_message, disable_web_page_preview=True)
+            await update_or_send_message(update, context, error_message)
+    elif user_data.get('contest_saved', False):
+        logging.info("Contest already saved, skipping.")
     else:
         logging.error(f"Missing data in pending_contest: {pending_contest}")
         error_message = "Ошибка: Не удалось сохранить конкурс. Проверьте введенные данные."
-
-        if update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(error_message, disable_web_page_preview=True)
-        else:
-            await update.message.reply_text(error_message, disable_web_page_preview=True)
+        await update_or_send_message(update, context, error_message)
 
     return WAITING_INPUT
 
 
 # Функция для отображения списка ожидающих конкурсов
-async def show_pending_contests(update, context):
+async def show_pending_contests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if update.effective_user.id not in ADMIN_USERS:
-        await query.edit_message_text("У вас недостаточно прав для просмотра этого раздела.")
-        return WAITING_INPUT
-
-    pending_contests = await get_pending_contests()
+    user_id = update.effective_user.id
+    pending_contests = await get_pending_contests(user_id)
 
     if not pending_contests:
-        message = "В данный момент нет ожидающих конкурсов."
-        keyboard = [[InlineKeyboardButton("Назад", callback_data='show_all_contests')]]
+        message = "У вас нет ожидающих конкурсов."
     else:
         message = "Ожидающие конкурсы:\n\n"
-        keyboard = []
-        for i, contest in enumerate(pending_contests, 1):
-            message += f"{i}. {contest['link']}\n"
-            keyboard.append([InlineKeyboardButton(f"Перенести {i}", callback_data=f'transfer_to_main_db_{i}')])
-        keyboard.append([InlineKeyboardButton("Назад", callback_data='show_all_contests')])
+        for contest in pending_contests:
+            link = contest.get('link', 'Ссылка отсутствует')
+            date = contest.get('date', 'Дата не указана')
+            message += f"<a href='{link}'>{link}</a>\nДата: {date}\n\n"
+
+    keyboard = [
+        [InlineKeyboardButton("🏆 Активные", callback_data='show_active'),
+         InlineKeyboardButton("🏁 Завершенные", callback_data='show_completed'),
+         InlineKeyboardButton("👀 Отслеживаемые", callback_data='show_tracked')],
+        [InlineKeyboardButton("🔄 Обновить", callback_data='refresh_pending')]
+    ]
+
+    is_admin = user_id in ADMIN_USERS
+    keyboard = add_admin_buttons(keyboard, is_admin)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(message, reply_markup=reply_markup, disable_web_page_preview=True)
+
+    await query.edit_message_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
     return WAITING_INPUT
 
 
@@ -1330,7 +1344,7 @@ async def transfer_to_main_db(update, context):
     await query.answer()
 
     if update.effective_user.id not in ADMIN_USERS:
-        await query.edit_message_text("У вас недостаточно прав для выполнения этой операции.")
+        await query.edit_message_text("У вас недостаточно прав для выполнения этой операции.", disable_web_page_preview=True)
         return WAITING_INPUT
 
     contest_index = int(query.data.split('_')[-1]) - 1
@@ -1355,11 +1369,11 @@ async def transfer_to_main_db(update, context):
             delete_query = "DELETE FROM contests.pending_contests WHERE link = $1"
             await execute_query(delete_query, (link,))
 
-            await query.edit_message_text(f"Конкурс {link} перенесен в основную базу данных.")
+            await query.edit_message_text(f"Конкурс {link} перенесен в основную базу данных.", disable_web_page_preview=True)
         else:
-            await query.edit_message_text("Не удалось найти данные о конкурсе в таблице ожидающих конкурсов.")
+            await query.edit_message_text("Не удалось найти данные о конкурсе в таблице ожидающих конкурсов.", disable_web_page_preview=True)
     else:
-        await query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
+        await query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте снова.", disable_web_page_preview=True)
 
     return WAITING_INPUT
 
@@ -1394,7 +1408,7 @@ def end_conversation(update, context):
     return ConversationHandler.END
 
 def main():
-    application = Application.builder().token("a").build()
+    application = Application.builder().token("1").build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
